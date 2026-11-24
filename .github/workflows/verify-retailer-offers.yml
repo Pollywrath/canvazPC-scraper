@@ -1,0 +1,170 @@
+name: Verify Retailer Offers
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Successful full-catalogue workflow run ID"
+        required: true
+        default: "45387631744"
+        type: string
+      source_artifact_name:
+        description: "Catalogue artifact name from that run"
+        required: true
+        default: "canvazpc-full-catalogue-run-2"
+        type: string
+      pause_seconds:
+        description: "Minimum seconds between request starts"
+        required: true
+        default: "1.0"
+        type: string
+      workers:
+        description: "Concurrent HTTP workers"
+        required: true
+        default: "4"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/run-retailer-verification.txt"
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: canvazpc-retailer-verification
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Independently verify retailer prices and stock
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      SOURCE_RUN_ID: ${{ github.event.inputs.source_run_id || '45387631744' }}
+      SOURCE_ARTIFACT_NAME: ${{ github.event.inputs.source_artifact_name || 'canvazpc-full-catalogue-run-2' }}
+      PAUSE_SECONDS: ${{ github.event.inputs.pause_seconds || '1.0' }}
+      WORKERS: ${{ github.event.inputs.workers || '4' }}
+
+    steps:
+      - name: Check out scraper repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Restore retailer verification checkpoint
+        uses: actions/cache@v4
+        with:
+          path: canvazpc_verification_checkpoint.jsonl
+          key: canvazpc-retailer-verify-v5-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            canvazpc-retailer-verify-v5-
+          save-always: true
+
+      - name: Install scraper dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Reconstruct exporter source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .github/payload/exporter-*.b64 | tr -d '\r\n' | base64 --decode > /tmp/canvazpc_export.py.gz
+          gzip --test /tmp/canvazpc_export.py.gz
+          gzip --decompress --stdout /tmp/canvazpc_export.py.gz > canvazpc_export.py
+          python -m py_compile canvazpc_export.py
+          python canvazpc_export.py --version
+
+      - name: Allow all four requested HTTP verification workers
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("canvazpc_export.py")
+          source = path.read_text(encoding="utf-8")
+          old = "with ThreadPoolExecutor(max_workers=min(args.workers, 2)) as pool:"
+          new = "with ThreadPoolExecutor(max_workers=args.workers) as pool:"
+          count = source.count(old)
+          if count != 1:
+              raise SystemExit(f"Expected exactly one HTTP worker cap to patch; found {count}.")
+          path.write_text(source.replace(old, new, 1), encoding="utf-8")
+          print("HTTP retailer verification now uses all --workers (maximum 4).")
+          PY
+          python -m py_compile canvazpc_export.py
+
+      - name: Run offline self-tests
+        run: python canvazpc_export.py --self-test
+
+      - name: Download completed catalogue artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.SOURCE_ARTIFACT_NAME }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          path: source
+
+      - name: Validate reusable catalogue checkpoint
+        run: |
+          set -euo pipefail
+          test -s source/canvazpc_full_catalogue_checkpoint.jsonl
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("source/canvazpc_full_catalogue_checkpoint.jsonl")
+          rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+          detailed = sum(1 for row in rows if isinstance(row.get("details"), dict))
+          offers = sum(len((row.get("details") or {}).get("offers") or []) for row in rows)
+          print(f"Reusable product-detail checkpoint: {detailed:,} products, {offers:,} retailer offers")
+          if detailed == 0 or offers == 0:
+              raise SystemExit("The source artifact does not contain reusable product details.")
+          PY
+
+      - name: Verify every unique retailer URL
+        id: verify
+        continue-on-error: true
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          python canvazpc_export.py --offers \
+            --verify-retailers \
+            --verify-limit 0 \
+            --verify-strategy diverse \
+            --pause "$PAUSE_SECONDS" \
+            --workers "$WORKERS" \
+            --browser-backend http \
+            --checkpoint source/canvazpc_full_catalogue_checkpoint.jsonl \
+            --verification-checkpoint canvazpc_verification_checkpoint.jsonl \
+            --out canvazpc_verified_catalogue
+
+      - name: Upload verified catalogue and resume checkpoint
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canvazpc-retailer-verification-run-${{ github.run_number }}
+          path: |
+            canvazpc_verified_catalogue.json
+            canvazpc_verified_catalogue.csv
+            canvazpc_verified_catalogue_offers.csv
+            canvazpc_verification_checkpoint.jsonl
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Fail the workflow if verification failed
+        if: steps.verify.outcome == 'failure'
+        run: |
+          echo "Retailer verification did not complete successfully. Any available verification checkpoint was uploaded above."
+          exit 1
