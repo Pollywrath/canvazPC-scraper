@@ -1,0 +1,101 @@
+name: Full CanvazPC Catalogue
+
+on:
+  workflow_dispatch:
+    inputs:
+      pause_seconds:
+        description: "Minimum seconds between request starts (2.0 recommended)"
+        required: true
+        default: "2.0"
+        type: string
+      workers:
+        description: "Concurrent product-page workers (2 recommended)"
+        required: true
+        default: "2"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: canvazpc-full-catalogue
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    name: Scrape all CanvazPC categories
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out scraper repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Restore previous product-page checkpoint
+        uses: actions/cache@v4
+        with:
+          path: canvazpc_full_catalogue_checkpoint.jsonl
+          key: canvazpc-full-v5-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            canvazpc-full-v5-
+
+      - name: Reconstruct exporter source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .github/payload/exporter-*.b64 | tr -d '\r\n' | base64 --decode > /tmp/canvazpc_export.py.gz
+          gzip --test /tmp/canvazpc_export.py.gz
+          gzip --decompress --stdout /tmp/canvazpc_export.py.gz > canvazpc_export.py
+          python -m py_compile canvazpc_export.py
+          python canvazpc_export.py --version
+
+      - name: Install scraper dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run offline self-tests
+        run: python canvazpc_export.py --self-test
+
+      - name: Scrape the complete public catalogue
+        id: scrape
+        continue-on-error: true
+        env:
+          PYTHONUNBUFFERED: "1"
+          PAUSE_SECONDS: ${{ inputs.pause_seconds }}
+          WORKERS: ${{ inputs.workers }}
+        run: |
+          set -euo pipefail
+          python canvazpc_export.py --offers \
+            --pause "$PAUSE_SECONDS" \
+            --workers "$WORKERS" \
+            --out canvazpc_full_catalogue
+
+      - name: Upload catalogue and checkpoint
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canvazpc-full-catalogue-run-${{ github.run_number }}
+          path: |
+            canvazpc_full_catalogue.json
+            canvazpc_full_catalogue.csv
+            canvazpc_full_catalogue_offers.csv
+            canvazpc_full_catalogue_checkpoint.jsonl
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Fail the workflow if scraping failed
+        if: steps.scrape.outcome == 'failure'
+        run: |
+          echo "Scraping did not complete successfully. Any available checkpoint/export files were uploaded above."
+          exit 1
