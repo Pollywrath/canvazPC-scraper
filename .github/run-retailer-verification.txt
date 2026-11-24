@@ -1,0 +1,4 @@
+source_run_id=45387631744
+source_artifact=canvazpc-full-catalogue-run-2
+pause_seconds=1.0
+workers=4
