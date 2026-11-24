@@ -15,12 +15,12 @@ This first workflow does **not** visit every retailer independently. Retailer ve
 
 ## Files
 
-- `canvazpc_export.py`: CanvazPC exporter v5.0.
+- `canvazpc_export.py`: reconstructed automatically on the runner from the compressed payload; the plaintext script is not stored in the repository.
 - `requirements.txt`: HTTP scraper dependencies.
 - `.github/workflows/full-catalogue.yml`: manually triggered full-catalogue cloud job.
 - `.github/payload/exporter-00N.b64`: compressed source payload fragments used by the workflow to restore the Python script before running.
 
-The exporter payload is gzip-compressed and base64-encoded in twelve ordered fragments. The workflow reconstructs the original Python source before installing dependencies and running it.
+The exporter payload is gzip-compressed and base64-encoded in twelve ordered fragments. The workflow concatenates and verifies the payload, reconstructs the original Python source, then runs the offline self-test before scraping. The twelve fragments have been checksum-verified against the local v5.0 exporter.
 
 ## Free usage
 
