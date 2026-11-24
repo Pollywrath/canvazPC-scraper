@@ -1,37 +1,41 @@
 # CanvazPC Full Catalogue Scraper
 
-This repository runs the v5.0 exporter on GitHub-hosted runners. The repository is public, so GitHub Actions can use standard Linux runners without consuming a private-repository minutes allowance.
+This repository runs the v5.0 exporter on GitHub-hosted runners. The repository is public, so standard GitHub-hosted Linux runners are available for these Actions jobs.
 
-## Run the full catalogue from your phone
+## 1. Collect the full catalogue
 
 1. Open the **Actions** tab.
 2. Select **Full CanvazPC Catalogue**.
 3. Select **Run workflow** and keep the defaults (2 workers, 2 seconds between request starts).
-4. Open the completed run and download the artifact named `canvazpc-full-catalogue-run-N` (the number is the workflow run number).
+4. Open the completed run and download the artifact named `canvazpc-full-catalogue-run-N`.
 
-The workflow scrapes **all discovered CanvazPC categories and product pages**. It deliberately does not set `--category`, `--limit`, or `--product-filter`. It uses `--offers` to collect product details and CanvazPC's aggregated retailer offer listings.
+This job scrapes all discovered CanvazPC categories and product pages. It collects specifications and CanvazPC's aggregated retailer offer listings. It does not independently visit retailer websites.
 
-This first workflow does **not** visit every retailer independently. Retailer verification is a separate, much larger operation and is intentionally disabled for the full-catalogue job.
+## 2. Independently verify retailer prices and stock
+
+1. Open the **Actions** tab.
+2. Select **Verify Retailer Offers**.
+3. Select **Run workflow**. The defaults point to the successful catalogue run #2, use a 1-second minimum interval, and use 4 HTTP workers.
+4. Download the artifact named `canvazpc-retailer-verification-run-N` when it finishes.
+
+The verification job downloads the previous catalogue artifact and reuses its 6,544-product detail checkpoint. It does **not** repeat the 6,544 product-page scrape. It reads current category listings to reconnect products, then visits each unique external retailer URL and evaluates the retrieved page against the expected product and seller. The source catalogue contains 16,686 offer records across 14,145 unique purchase URLs.
+
+The 4 workers allow slow page requests to overlap. The shared rate limiter still enforces at least 1 second between request starts across all workers; this is not four requests per second. The verification job has a six-hour limit and saves a resumable verification checkpoint in its artifact/cache.
+
+A retailer can still block automated requests, require a variant selection, omit a price, or provide no explicit stock information. Those results are recorded as blocked/unverified/ambiguous rather than being treated as confirmed prices. The job does not bypass access controls, solve CAPTCHAs, use proxies to evade blocks, or log in.
 
 ## Files
 
 - `canvazpc_export.py`: reconstructed automatically on the runner from the compressed payload; the plaintext script is not stored in the repository.
 - `requirements.txt`: HTTP scraper dependencies.
-- `.github/workflows/full-catalogue.yml`: manually triggered full-catalogue cloud job.
-- `.github/payload/exporter-00N.b64`: compressed source payload fragments used by the workflow to restore the Python script before running.
+- `.github/workflows/full-catalogue.yml`: full-catalogue cloud job.
+- `.github/workflows/verify-retailer-offers.yml`: independent retailer verification job.
+- `.github/payload/exporter-00N.b64`: compressed source payload fragments used to restore the Python script.
 
-The exporter payload is gzip-compressed and base64-encoded in twelve ordered fragments. The workflow concatenates and verifies the payload, reconstructs the original Python source, then runs the offline self-test before scraping. The twelve fragments have been checksum-verified against the local v5.0 exporter.
+The exporter payload is gzip-compressed and base64-encoded in ordered fragments. Workflows concatenate and verify the payload, reconstruct the Python source, and run offline self-tests before network requests.
 
-## Free usage
+## Request behavior and resume
 
-Because this repository is public, standard GitHub-hosted runners are free for this workflow under GitHub's public-repository Actions policy. This job is set to a maximum of six hours. Runtime depends on CanvazPC response times and the site's current catalogue size.
+The full-catalogue workflow uses 2 workers and a shared 2-second request-start interval by default. The verification workflow defaults to 4 HTTP workers and a shared 1-second request-start interval. Each workflow is serialized independently so two large crawls of the same type do not run simultaneously.
 
-## Request behavior
-
-Defaults are conservative: 2 workers with a shared 2-second minimum interval between request starts. The job is serialized so you don't accidentally run multiple full-catalogue crawls simultaneously.
-
-The scraper only requests public CanvazPC pages. It does not bypass access controls, solve CAPTCHAs, use proxies to evade blocks, or log in.
-
-## Resume behavior
-
-The workflow restores the most recent GitHub Actions cache containing the product-detail checkpoint when available. Each run attempt writes a new cache key. The checkpoint is also included in the downloadable artifact when the upload step is reached. A hard runner timeout can prevent final artifact upload and cache-saving cleanup from running.
+The verification workflow restores the most recent GitHub Actions cache containing its product/seller-specific verification checkpoint. Verified results are reused only while fresh; blocked and fetch-error results are retried. The checkpoint is also included in the downloadable artifact when the upload step is reached.
